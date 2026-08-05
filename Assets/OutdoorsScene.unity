@@ -601,7 +601,7 @@ Rigidbody:
   m_IsKinematic: 0
   m_Interpolate: 0
   m_Constraints: 0
-  m_CollisionDetection: 0
+  m_CollisionDetection: 1
 --- !u!1 &899270636
 GameObject:
   m_ObjectHideFlags: 0
@@ -737,6 +737,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5f66babea77c060ea9b04949a99dacc9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PlayerSpotController
+  InterpolateMomentum: 0.5
+  MomentumMultiplier: 50
+  PickDistance: 10
+  MoveDistance: 2.5
 --- !u!1 &1792500275
 GameObject:
   m_ObjectHideFlags: 0
@@ -845,7 +849,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: -4.24446, y: -0, z: -2.71151}
-  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_LocalScale: {x: 2, y: 2, z: 2}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
