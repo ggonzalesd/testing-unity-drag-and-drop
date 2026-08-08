@@ -22,7 +22,16 @@ public class PlayerSpotController : MonoBehaviour
   private float PickDistance = 2.5f;
   [SerializeField]
   [Range(0.0f, 20.0f)]
+  [Tooltip("Leash radius around the player. Also caps how far the wheel can push the item away.")]
   private float MoveDistance = 2.5f;
+  [SerializeField]
+  [Range(0.0f, 20.0f)]
+  [Tooltip("Near-plane floor: the wheel can never pull the item closer than this to the camera. The real reach limit is MoveDistance.")]
+  private float MinHoldDistance = 0.5f;
+  [SerializeField]
+  [Range(0.0f, 2.0f)]
+  [Tooltip("How far one wheel notch pushes the item along the view direction. 0 disables it.")]
+  private float HoldDistanceStep = 0.25f;
   [SerializeField]
   [Tooltip("Drops the item when the grab point falls this far behind the anchor. 0 disables it.")]
   private float BreakDistance = 4.0f;
@@ -49,6 +58,15 @@ public class PlayerSpotController : MonoBehaviour
   [Header("Rotation")]
   [SerializeField]
   private float RotationSpeed = 190.0f;
+  [SerializeField]
+  [Tooltip("Axis A/D turns around on items without an ItemRotationAxes.")]
+  private ItemRotationAxis DefaultYawAxis = ItemRotationAxis.WorldUp;
+  [SerializeField]
+  [Tooltip("Axis W/S turns around on items without an ItemRotationAxes.")]
+  private ItemRotationAxis DefaultPitchAxis = ItemRotationAxis.LocalForward;
+  [SerializeField]
+  [Tooltip("Axis Q/E turns around on items without an ItemRotationAxes.")]
+  private ItemRotationAxis DefaultRollAxis = ItemRotationAxis.WorldForward;
   [SerializeField]
   private float TorqueSpring = 200.0f;
   [SerializeField]
@@ -102,15 +120,31 @@ public class PlayerSpotController : MonoBehaviour
   // the player is asking for.
   private Vector3 heldAngularVelocity = Vector3.zero;
 
+  // Axes the current target turns around. Read off the item once on pick, since
+  // a component swap mid hold is not a case worth paying a lookup per step for.
+  private ItemRotationAxis yawAxis;
+  private ItemRotationAxis pitchAxis;
+  private ItemRotationAxis rollAxis;
+
   // Smoothed anchor: raw pointer noise would reach the solver as impulses and
   // shake anything resting on the item.
   private Vector3 anchor = Vector3.zero;
   private Vector3 anchorVelocity = Vector3.zero;
 
+  // Depth of the plane the pointer is projected onto, measured from the camera.
+  // Seeded from where the item was picked, then driven by the wheel. Measuring
+  // it from the player spot instead only works when the spot is what the camera
+  // is flying through; with the camera parked behind the spot the picked item
+  // sits almost on the spot's own plane, so the depth starts pinned at its
+  // minimum and the wheel can only ever push outwards.
+  private float holdDepth;
+
   // Input is sampled in Update (edge events would be missed in FixedUpdate)
   // and consumed in FixedUpdate, where the Rigidbody is actually driven.
-  private Vector2 rotationInput = Vector2.zero;
+  // x is yaw (A/D), y is pitch (W/S), z is roll (Q/E).
+  private Vector3 rotationInput = Vector3.zero;
   private Vector2 pointerPosition = Vector2.zero;
+  private float distanceInput;
   private bool levelRequested;
 
   private bool targetFrozeRotation;
@@ -195,13 +229,14 @@ public class PlayerSpotController : MonoBehaviour
     Keyboard keyboard = Keyboard.current;
     Mouse mouse = Mouse.current;
 
-    // Horizontal (A/D) rotates around the camera's Up axis,
-    // vertical (W/S) around the camera's Right axis.
+    // A/D is yaw, W/S is pitch, Q/E is roll. Which axis each one actually turns
+    // around is the held item's call: see ItemRotationAxes.
     rotationInput = keyboard == null
-      ? Vector2.zero
-      : new Vector2(
+      ? Vector3.zero
+      : new Vector3(
         (keyboard.dKey.isPressed ? -1.0f : 0.0f) - (keyboard.aKey.isPressed ? -1.0f : 0.0f),
-        (keyboard.wKey.isPressed ? -1.0f : 0.0f) - (keyboard.sKey.isPressed ? -1.0f : 0.0f));
+        (keyboard.wKey.isPressed ? 1.0f : 0.0f) - (keyboard.sKey.isPressed ? 1.0f : 0.0f),
+        (keyboard.eKey.isPressed ? -1.0f : 0.0f) - (keyboard.qKey.isPressed ? -1.0f : 0.0f));
 
     if (mouse == null) return;
 
@@ -210,6 +245,12 @@ public class PlayerSpotController : MonoBehaviour
     // Latched: Update can run several times between physics steps, so the edge
     // would be lost if FixedUpdate simply polled it.
     levelRequested |= mouse.rightButton.wasPressedThisFrame;
+
+    // Also latched, and reduced to notches rather than accumulated raw: the
+    // wheel delta is 120 per notch on some platforms and 1 on others, so the
+    // sign is the only part that means the same thing everywhere.
+    float scroll = mouse.scroll.ReadValue().y;
+    if (!Mathf.Approximately(scroll, 0.0f)) distanceInput += Mathf.Sign(scroll);
   }
 
   void HandleTarget()
@@ -221,7 +262,8 @@ public class PlayerSpotController : MonoBehaviour
 
     float deltaTime = Time.fixedDeltaTime;
 
-    UpdateHeldRotation(cam, deltaTime);
+    UpdateHeldRotation(deltaTime);
+    UpdateHoldDistance(cam);
 
     anchor = Vector3.SmoothDamp(anchor, ResolveAnchor(cam), ref anchorVelocity, AnchorSmoothTime, Mathf.Infinity, deltaTime);
 
@@ -244,7 +286,7 @@ public class PlayerSpotController : MonoBehaviour
     );
   }
 
-  void UpdateHeldRotation(Camera cam, float deltaTime)
+  void UpdateHeldRotation(float deltaTime)
   {
     if (levelRequested)
     {
@@ -252,22 +294,47 @@ public class PlayerSpotController : MonoBehaviour
       heldRotation = LevelRotation(heldRotation);
     }
 
-    // Both axes are levelled: A/D yaws around world up, W/S pitches around the
-    // camera's right flattened onto XZ. Using the camera's own tilted up/right
-    // would leak the view pitch into the item as roll and tip it over.
-    Vector3 pitchAxis = Vector3.ProjectOnPlane(cam.transform.right, Vector3.up);
-    pitchAxis = pitchAxis.sqrMagnitude > Mathf.Epsilon ? pitchAxis.normalized : Vector3.right;
+    // Which edge of an item is worth turning around is a property of the item,
+    // not of the hold, so the axes come from the target. All three are resolved
+    // against the commanded rotation rather than the Rigidbody's: the body lags
+    // behind by design, so a local axis read off it would drift while a key is
+    // held and bend the turn as it goes.
+    Vector3 yawDirection = ItemRotationAxes.Resolve(yawAxis, heldRotation);
+    Vector3 pitchDirection = ItemRotationAxes.Resolve(pitchAxis, heldRotation);
+    Vector3 rollDirection = ItemRotationAxes.Resolve(rollAxis, heldRotation);
 
-    Quaternion horizontalRotation = Quaternion.AngleAxis(-rotationInput.x * RotationSpeed * deltaTime, Vector3.up);
-    Quaternion verticalRotation = Quaternion.AngleAxis(rotationInput.y * RotationSpeed * deltaTime, pitchAxis);
+    Quaternion yaw = Quaternion.AngleAxis(-rotationInput.x * RotationSpeed * deltaTime, yawDirection);
+    Quaternion pitch = Quaternion.AngleAxis(rotationInput.y * RotationSpeed * deltaTime, pitchDirection);
+    Quaternion roll = Quaternion.AngleAxis(rotationInput.z * RotationSpeed * deltaTime, rollDirection);
 
-    heldRotation = horizontalRotation * verticalRotation * heldRotation;
+    heldRotation = yaw * pitch * roll * heldRotation;
 
-    // Same two axis rates the rotation above just applied, kept as a world
+    // Same three axis rates the rotation above just applied, kept as a world
     // angular velocity so the torque damper can subtract it out.
     heldAngularVelocity =
-      Vector3.up * (-rotationInput.x * RotationSpeed * Mathf.Deg2Rad)
-      + pitchAxis * (rotationInput.y * RotationSpeed * Mathf.Deg2Rad);
+      yawDirection * (-rotationInput.x * RotationSpeed * Mathf.Deg2Rad)
+      + pitchDirection * (rotationInput.y * RotationSpeed * Mathf.Deg2Rad)
+      + rollDirection * (rotationInput.z * RotationSpeed * Mathf.Deg2Rad);
+  }
+
+  // Consumes the latched wheel notches. Cleared even when the step is disabled,
+  // or the notches would pile up and jump the item the moment it is re-enabled.
+  void UpdateHoldDistance(Camera cam)
+  {
+    float notches = distanceInput;
+    distanceInput = 0.0f;
+
+    if (HoldDistanceStep <= 0.0f) return;
+
+    // Bounded by the same leash the anchor is clamped to, centred on the depth
+    // of the player spot. Letting the depth run past the leash would bank
+    // notches the player has to unwind before the item moves again.
+    float spotDepth = Vector3.Dot(transform.position - cam.transform.position, cam.transform.forward);
+
+    holdDepth = Mathf.Clamp(
+      holdDepth + notches * HoldDistanceStep,
+      Mathf.Max(MinHoldDistance, spotDepth - MoveDistance),
+      spotDepth + MoveDistance);
   }
 
   // Drops pitch and roll and keeps only the yaw, so the item stands upright
@@ -285,11 +352,16 @@ public class PlayerSpotController : MonoBehaviour
     return Quaternion.LookRotation(forward.normalized, Vector3.up);
   }
 
-  // Pointer projected onto the plane through the player, clamped to reach.
-  // Falls back to holding the grab point where it already is.
+  // Pointer projected onto a plane sitting holdDepth ahead of the camera,
+  // clamped to reach. Falls back to holding the grab point where it already is.
   Vector3 ResolveAnchor(Camera cam)
   {
-    Plane plane = new(-cam.transform.forward, transform.position);
+    Vector3 forward = cam.transform.forward;
+
+    // The plane moves with the wheel, but the clamp stays centred on the player:
+    // MoveDistance is the leash, and holdDepth is capped by it, so pushing the
+    // item away spends the same reach that dragging it sideways does.
+    Plane plane = new(-forward, cam.transform.position + forward * holdDepth);
     Ray ray = cam.ScreenPointToRay(pointerPosition);
 
     if (!plane.Raycast(ray, out float distance)) return PivotWorld;
@@ -439,6 +511,9 @@ public class PlayerSpotController : MonoBehaviour
     pivotLocal = Vector3.zero;
     heldRotation = Quaternion.identity;
     heldAngularVelocity = Vector3.zero;
+    yawAxis = DefaultYawAxis;
+    pitchAxis = DefaultPitchAxis;
+    rollAxis = DefaultRollAxis;
     anchorVelocity = Vector3.zero;
     levelRequested = false;
   }
@@ -482,6 +557,8 @@ public class PlayerSpotController : MonoBehaviour
     heldRotation = body.rotation;
     heldAngularVelocity = Vector3.zero;
 
+    ResolveRotationAxes(body);
+
     // Gravity stays untouched: the spring carries the weight, and anything
     // stacked on top needs a support that pushes back like a real body.
     body.isKinematic = false;
@@ -500,6 +577,27 @@ public class PlayerSpotController : MonoBehaviour
     anchorVelocity = Vector3.zero;
     momentum = body.linearVelocity;
     levelRequested = false;
+
+    // Seeded from where the item actually was, so it stays put on pick instead
+    // of being yanked to a fixed depth. Measured along the view direction
+    // because that is the axis the pointer plane is perpendicular to. Left
+    // unclamped: it is already inside the leash, and the first wheel step
+    // clamps it anyway.
+    holdDepth = Vector3.Dot(anchor - cam.transform.position, cam.transform.forward);
+
+    // Notches collected while nothing was held would move the item on frame one.
+    distanceInput = 0.0f;
+  }
+
+  // Looked up on the Rigidbody rather than on the collider that was hit, so a
+  // multi collider item is configured once at its root instead of once per part.
+  void ResolveRotationAxes(Rigidbody body)
+  {
+    ItemRotationAxes axes = body.GetComponent<ItemRotationAxes>();
+
+    yawAxis = axes != null ? axes.YawAxis : DefaultYawAxis;
+    pitchAxis = axes != null ? axes.PitchAxis : DefaultPitchAxis;
+    rollAxis = axes != null ? axes.RollAxis : DefaultRollAxis;
   }
 
   // A thin item has a far smaller inertia around its long axis than around the

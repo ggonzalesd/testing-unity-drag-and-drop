@@ -909,6 +909,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::PlayerSpotController
   PickDistance: 7
   MoveDistance: 7
+  MinHoldDistance: 0.5
+  HoldDistanceStep: 0.25
   BreakDistance: 8
   HoldSpring: 500
   HoldDamping: 0.5
@@ -916,6 +918,9 @@ MonoBehaviour:
   CompensateGravity: 1
   AnchorSmoothTime: 0.05
   RotationSpeed: 90
+  DefaultYawAxis: 1
+  DefaultPitchAxis: 5
+  DefaultRollAxis: 2
   TorqueSpring: 300
   TorqueDamping: 1.5
   MaxHoldAngularAcceleration: 400
