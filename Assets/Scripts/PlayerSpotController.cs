@@ -38,6 +38,7 @@ public class PlayerSpotController : MonoBehaviour
   [Tooltip("1 is critically damped: fastest approach without overshoot.")]
   private float HoldDamping = 1.0f;
   [SerializeField]
+  [Tooltip("Caps the spring pull only. The damper is never scaled down, so a saturated spring cannot leave the hold undamped.")]
   private float MaxHoldAcceleration = 250.0f;
   [SerializeField]
   [Tooltip("Cancels the sag the spring would otherwise show under gravity.")]
@@ -45,7 +46,7 @@ public class PlayerSpotController : MonoBehaviour
   [SerializeField]
   [Range(0.0f, 0.5f)]
   [Tooltip("Smooths pointer noise before it reaches the physics solver.")]
-  private float AnchorSmoothTime = 0.05f;
+  private float AnchorSmoothTime = 0.02f;
 
   [Header("Rotation")]
   [SerializeField]
@@ -76,6 +77,10 @@ public class PlayerSpotController : MonoBehaviour
   [SerializeField]
   [Range(1, 30)]
   private int HeldSolverVelocityIterations = 4;
+  [SerializeField]
+  [Range(0.0f, 1.0f)]
+  [Tooltip("Raises the smallest inertia axis to this fraction of the largest while held. A 4x0.25x1 stick has 16x less inertia around its long axis, which turns any residual torque into a spin. 0 disables it.")]
+  private float MinInertiaRatio = 0.25f;
 
   private Camera mainCamera;
   private Rigidbody target;
@@ -88,6 +93,11 @@ public class PlayerSpotController : MonoBehaviour
   // Orientation the hold aims for. The Rigidbody reaches it through torque, so
   // it lags on purpose whenever something resists.
   private Quaternion heldRotation = Quaternion.identity;
+
+  // Rate the commanded orientation is turning at. The torque damper measures
+  // against this instead of against zero, or it would brake the very rotation
+  // the player is asking for.
+  private Vector3 heldAngularVelocity = Vector3.zero;
 
   // Smoothed anchor: raw pointer noise would reach the solver as impulses and
   // shake anything resting on the item.
@@ -106,12 +116,18 @@ public class PlayerSpotController : MonoBehaviour
   private CollisionDetectionMode targetCollisionDetection;
   private int targetSolverIterations;
   private int targetSolverVelocityIterations;
+  private bool targetAutomaticInertiaTensor;
+  private Vector3 targetInertiaTensor;
 
   private Camera MainCamera => mainCamera != null ? mainCamera : mainCamera = Camera.main;
 
   // Where the grab point actually is right now. Uses the Rigidbody's real
   // rotation, not the commanded one, because forces act on the real pose.
   private Vector3 PivotWorld => target.position + target.rotation * pivotLocal;
+
+  // Lever arm of the grab point. Measured from the center of mass, because that
+  // is what linearVelocity refers to and what angularVelocity turns around.
+  private Vector3 PivotLever => PivotWorld - target.worldCenterOfMass;
 
   void Update()
   {
@@ -208,8 +224,8 @@ public class PlayerSpotController : MonoBehaviour
       return;
     }
 
-    ApplyHoldForce();
-    ApplyHoldTorque();
+    ApplyHoldForce(deltaTime);
+    ApplyHoldTorque(deltaTime);
 
     // The body carries a real velocity now, so the throw is just a smoothed
     // reading of it rather than a separately integrated guess.
@@ -236,6 +252,12 @@ public class PlayerSpotController : MonoBehaviour
     Quaternion verticalRotation = Quaternion.AngleAxis(rotationInput.y * RotationSpeed * deltaTime, pitchAxis);
 
     heldRotation = horizontalRotation * verticalRotation * heldRotation;
+
+    // Same two axis rates the rotation above just applied, kept as a world
+    // angular velocity so the torque damper can subtract it out.
+    heldAngularVelocity =
+      Vector3.up * (-rotationInput.x * RotationSpeed * Mathf.Deg2Rad)
+      + pitchAxis * (rotationInput.y * RotationSpeed * Mathf.Deg2Rad);
   }
 
   // Drops pitch and roll and keeps only the yaw, so the item stands upright
@@ -267,31 +289,50 @@ public class PlayerSpotController : MonoBehaviour
     return Vector3.ClampMagnitude(worldPosition - transform.position, MoveDistance) + transform.position;
   }
 
-  void ApplyHoldForce()
+  void ApplyHoldForce(float deltaTime)
   {
     Vector3 pivot = PivotWorld;
+    Vector3 lever = PivotLever;
 
     // Velocity of the grab point itself, not of the body center: the lever arm
     // contributes through the angular term.
-    Vector3 pivotVelocity = target.linearVelocity + Vector3.Cross(target.angularVelocity, pivot - target.position);
+    Vector3 pivotVelocity = target.linearVelocity + Vector3.Cross(target.angularVelocity, lever);
 
-    float damper = CriticalDampingFactor * Mathf.Sqrt(HoldSpring) * HoldDamping;
-    Vector3 acceleration = (anchor - pivot) * HoldSpring - pivotVelocity * damper;
+    // The anchor is what the grab point is supposed to ride along with, so the
+    // damper measures the velocity relative to it. Damping the absolute velocity
+    // instead makes the damper fight every fast drag: the item lags, the spring
+    // winds up, and it snaps back the moment the pointer settles.
+    Vector3 relativeVelocity = pivotVelocity - anchorVelocity;
 
-    if (CompensateGravity && target.useGravity) acceleration -= Physics.gravity;
+    float damper = StableDamper(HoldSpring, HoldDamping, deltaTime);
 
-    acceleration = Vector3.ClampMagnitude(acceleration, MaxHoldAcceleration);
+    // Only the spring is capped. Scaling the damper down along with it would
+    // strip the hold of damping exactly during the fast moves that saturate it.
+    Vector3 acceleration =
+      Vector3.ClampMagnitude((anchor - pivot) * HoldSpring, MaxHoldAcceleration)
+      - relativeVelocity * damper;
+
+    // A force at a lever arm also spins the body, so the grab point accelerates
+    // by far more than force/mass: for the 4x0.25x1 stick held at its tip the
+    // point responds as if it weighed a quarter of the body. Dividing by the
+    // effective mass along the pull cancels that, which is what keeps the
+    // tuning stable for long items instead of ringing at the solver rate.
+    float inverseEffectiveMass = InverseEffectiveMass(lever, acceleration);
+    Vector3 force = inverseEffectiveMass > Mathf.Epsilon ? acceleration / inverseEffectiveMass : Vector3.zero;
 
     // Applying at the pivot yields the torque that makes the item hang from the
-    // grab point instead of from its center. Acceleration mode keeps the tuning
-    // independent of the item's mass.
-    target.AddForceAtPosition(acceleration, pivot, ForceMode.Acceleration);
+    // grab point instead of from its center.
+    target.AddForceAtPosition(force, pivot, ForceMode.Force);
+
+    // Gravity pulls at the center of mass and produces no torque there, so its
+    // counterweight has to be applied the same way. Folding it into the pivot
+    // force would invent a torque the orientation spring then has to fight.
+    if (CompensateGravity && target.useGravity) target.AddForce(-Physics.gravity, ForceMode.Acceleration);
   }
 
-  void ApplyHoldTorque()
+  void ApplyHoldTorque(float deltaTime)
   {
-    float damper = CriticalDampingFactor * Mathf.Sqrt(TorqueSpring) * TorqueDamping;
-    Vector3 torque = -target.angularVelocity * damper;
+    float damper = StableDamper(TorqueSpring, TorqueDamping, deltaTime);
 
     Quaternion delta = heldRotation * Quaternion.Inverse(target.rotation);
 
@@ -300,12 +341,62 @@ public class PlayerSpotController : MonoBehaviour
 
     delta.ToAngleAxis(out float angle, out Vector3 axis);
 
+    Vector3 spring = Vector3.zero;
+
     if (angle > Mathf.Epsilon && !float.IsInfinity(axis.sqrMagnitude))
     {
-      torque += axis.normalized * (angle * Mathf.Deg2Rad * TorqueSpring);
+      spring = axis.normalized * (angle * Mathf.Deg2Rad * TorqueSpring);
     }
 
-    target.AddTorque(Vector3.ClampMagnitude(torque, MaxHoldAngularAcceleration), ForceMode.Acceleration);
+    // Damped against the commanded turn rate, not against zero, so holding a
+    // rotation key does not run the spring and the damper against each other.
+    Vector3 torque =
+      Vector3.ClampMagnitude(spring, MaxHoldAngularAcceleration)
+      - (target.angularVelocity - heldAngularVelocity) * damper;
+
+    // Acceleration mode already divides by the inertia tensor, so this control
+    // path needs no effective-mass correction of its own.
+    target.AddTorque(torque, ForceMode.Acceleration);
+  }
+
+  // Critical damping for the given stiffness, held below the rate at which an
+  // explicit step would overshoot. Past damper * dt = 1 the correction flips the
+  // velocity's sign every step, which reads as a high frequency tremble rather
+  // than as damping.
+  static float StableDamper(float spring, float damping, float deltaTime)
+  {
+    float damper = CriticalDampingFactor * Mathf.Sqrt(spring) * damping;
+
+    return deltaTime > Mathf.Epsilon ? Mathf.Min(damper, 1.0f / deltaTime) : damper;
+  }
+
+  // Inverse of the mass the grab point presents along a direction:
+  // 1/m + (r x n)^T * I^-1 * (r x n), the same term a point constraint solves for.
+  float InverseEffectiveMass(Vector3 lever, Vector3 direction)
+  {
+    float inverseMass = target.mass > Mathf.Epsilon ? 1.0f / target.mass : 0.0f;
+
+    if (direction.sqrMagnitude <= Mathf.Epsilon) return inverseMass;
+
+    Vector3 leverCrossDirection = Vector3.Cross(lever, direction.normalized);
+
+    return inverseMass + Vector3.Dot(leverCrossDirection, InverseInertiaTimes(leverCrossDirection));
+  }
+
+  // I^-1 * v in world space. The tensor is diagonal in its own principal frame,
+  // so the vector is rotated into that frame, scaled, and rotated back.
+  Vector3 InverseInertiaTimes(Vector3 worldVector)
+  {
+    Quaternion principal = target.rotation * target.inertiaTensorRotation;
+    Vector3 local = Quaternion.Inverse(principal) * worldVector;
+    Vector3 inertia = target.inertiaTensor;
+
+    local = new Vector3(
+      inertia.x > Mathf.Epsilon ? local.x / inertia.x : 0.0f,
+      inertia.y > Mathf.Epsilon ? local.y / inertia.y : 0.0f,
+      inertia.z > Mathf.Epsilon ? local.z / inertia.z : 0.0f);
+
+    return principal * local;
   }
 
   void ReleaseTarget()
@@ -326,11 +417,17 @@ public class PlayerSpotController : MonoBehaviour
     target.solverIterations = targetSolverIterations;
     target.solverVelocityIterations = targetSolverVelocityIterations;
 
+    // Order matters: assigning the tensor turns the automatic one off, so the
+    // flag has to be restored after the value it overrides.
+    target.inertiaTensor = targetInertiaTensor;
+    target.automaticInertiaTensor = targetAutomaticInertiaTensor;
+
     if (!target.isKinematic) target.linearVelocity = momentum * ThrowMultiplier;
 
     target = null;
     pivotLocal = Vector3.zero;
     heldRotation = Quaternion.identity;
+    heldAngularVelocity = Vector3.zero;
     anchorVelocity = Vector3.zero;
     levelRequested = false;
   }
@@ -364,11 +461,14 @@ public class PlayerSpotController : MonoBehaviour
     targetCollisionDetection = body.collisionDetectionMode;
     targetSolverIterations = body.solverIterations;
     targetSolverVelocityIterations = body.solverVelocityIterations;
+    targetAutomaticInertiaTensor = body.automaticInertiaTensor;
+    targetInertiaTensor = body.inertiaTensor;
 
     pivotLocal = ResolvePivotLocal(hit);
 
     // The item keeps whatever orientation it had; the hold takes it over as-is.
     heldRotation = body.rotation;
+    heldAngularVelocity = Vector3.zero;
 
     // Gravity stays untouched: the spring carries the weight, and anything
     // stacked on top needs a support that pushes back like a real body.
@@ -376,14 +476,32 @@ public class PlayerSpotController : MonoBehaviour
     // Rotation constraints would swallow the hold torque.
     body.freezeRotation = false;
     body.interpolation = RigidbodyInterpolation.Interpolate;
-    body.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+    // Speculative contacts, not sweeps: a body driven by a spring reverses often
+    // enough that CCD sweeps keep re-resolving the same contact and buzz.
+    body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
     body.solverIterations = HeldSolverIterations;
     body.solverVelocityIterations = HeldSolverVelocityIterations;
+
+    ThickenInertiaTensor(body);
 
     anchor = PivotWorld;
     anchorVelocity = Vector3.zero;
     momentum = body.linearVelocity;
     levelRequested = false;
+  }
+
+  // A thin item has a far smaller inertia around its long axis than around the
+  // other two, so the same leftover torque spins it many times faster there.
+  // Raising the floor while it is held evens the axes out; the real tensor comes
+  // back on release.
+  void ThickenInertiaTensor(Rigidbody body)
+  {
+    if (MinInertiaRatio <= 0.0f) return;
+
+    Vector3 inertia = body.inertiaTensor;
+    float floor = Mathf.Max(inertia.x, inertia.y, inertia.z) * MinInertiaRatio;
+
+    body.inertiaTensor = Vector3.Max(inertia, Vector3.one * floor);
   }
 
   Vector3 ResolvePivotLocal(RaycastHit hit)

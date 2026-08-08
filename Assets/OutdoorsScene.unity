@@ -861,11 +861,11 @@ MonoBehaviour:
   MoveDistance: 7
   BreakDistance: 8
   HoldSpring: 500
-  HoldDamping: 0.25
+  HoldDamping: 0.5
   MaxHoldAcceleration: 250
   CompensateGravity: 1
   AnchorSmoothTime: 0.05
-  RotationSpeed: 90
+  RotationSpeed: 180
   TorqueSpring: 300
   TorqueDamping: 1.5
   MaxHoldAngularAcceleration: 400
@@ -874,6 +874,7 @@ MonoBehaviour:
   ThrowMultiplier: 1
   HeldSolverIterations: 12
   HeldSolverVelocityIterations: 4
+  MinInertiaRatio: 0.25
 --- !u!65 &1497899347
 BoxCollider:
   m_ObjectHideFlags: 0
