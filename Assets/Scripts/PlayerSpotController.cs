@@ -13,8 +13,6 @@ public class PlayerSpotController : MonoBehaviour
     CenterOfMass,
   }
 
-  private const string ItemTag = "Item";
-
   // A damping ratio of 1 is critical damping: damper = 2 * sqrt(spring).
   private const float CriticalDampingFactor = 2.0f;
 
@@ -82,6 +80,11 @@ public class PlayerSpotController : MonoBehaviour
   [Tooltip("Raises the smallest inertia axis to this fraction of the largest while held. A 4x0.25x1 stick has 16x less inertia around its long axis, which turns any residual torque into a spin. 0 disables it.")]
   private float MinInertiaRatio = 0.25f;
 
+  // Mirrors the current target so a carrier can check whether an item is
+  // already in the player's hand before capturing it. One slot: there is a
+  // single controller driving the hold.
+  private static Rigidbody heldBody;
+
   private Camera mainCamera;
   private Rigidbody target;
   private Vector3 momentum = Vector3.zero;
@@ -118,6 +121,13 @@ public class PlayerSpotController : MonoBehaviour
   private int targetSolverVelocityIterations;
   private bool targetAutomaticInertiaTensor;
   private Vector3 targetInertiaTensor;
+
+  public static bool IsHeld(Rigidbody body) => body != null && body == heldBody;
+
+  // Domain reload can be turned off for play mode, which would carry a stale
+  // reference from the previous run into the next one.
+  [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+  static void ResetStatics() => heldBody = null;
 
   private Camera MainCamera => mainCamera != null ? mainCamera : mainCamera = Camera.main;
 
@@ -425,6 +435,7 @@ public class PlayerSpotController : MonoBehaviour
     if (!target.isKinematic) target.linearVelocity = momentum * ThrowMultiplier;
 
     target = null;
+    heldBody = null;
     pivotLocal = Vector3.zero;
     heldRotation = Quaternion.identity;
     heldAngularVelocity = Vector3.zero;
@@ -444,7 +455,7 @@ public class PlayerSpotController : MonoBehaviour
     Ray ray = cam.ScreenPointToRay(pointerPosition);
 
     if (!Physics.Raycast(ray, out RaycastHit hit)) return;
-    if (!hit.collider.CompareTag(ItemTag)) return;
+    if (!hit.collider.CompareTag(ItemTags.Item)) return;
 
     // Reach is measured against the surface actually hit.
     if (Vector3.Distance(transform.position, hit.point) > PickDistance) return;
@@ -455,6 +466,7 @@ public class PlayerSpotController : MonoBehaviour
     Debug.Log($"PICK {hit.collider.name}");
 
     target = body;
+    heldBody = body;
     targetFrozeRotation = body.freezeRotation;
     targetIsKinematic = body.isKinematic;
     targetInterpolation = body.interpolation;
