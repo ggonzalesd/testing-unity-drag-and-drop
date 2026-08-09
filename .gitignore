@@ -84,5 +84,12 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+/Library/TMP/
+[Ll]library/
+[Tt]emp/
+[Bb]uild/
+[Bb]uilds/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
 
 # End of https://www.toptal.com/developers/gitignore/api/dotnetcore,unity
